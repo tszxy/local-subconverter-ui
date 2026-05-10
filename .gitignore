@@ -1,0 +1,7 @@
+.DS_Store
+*.log
+*.pid
+*.tar.gz
+ui/raw/
+subconverter/subconverter.log
+subconverter/subconverter.pid

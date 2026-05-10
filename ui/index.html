@@ -1,0 +1,459 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>本地订阅转换</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --text: #17202a;
+      --muted: #667085;
+      --line: #d9dee7;
+      --primary: #1769e0;
+      --primary-dark: #0d56bd;
+      --danger: #b42318;
+      --ok: #087443;
+      --shadow: 0 16px 40px rgba(20, 31, 46, 0.08);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 15px;
+    }
+
+    main {
+      width: min(960px, calc(100vw - 32px));
+      margin: 32px auto;
+    }
+
+    header {
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 24px;
+      margin-bottom: 18px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 30px;
+      line-height: 1.15;
+      letter-spacing: 0;
+    }
+
+    .status {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 34px;
+      padding: 7px 11px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      color: var(--muted);
+      white-space: nowrap;
+    }
+
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: var(--muted);
+    }
+
+    .status.ok .dot {
+      background: var(--ok);
+    }
+
+    .status.bad .dot {
+      background: var(--danger);
+    }
+
+    section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      padding: 20px;
+    }
+
+    label {
+      display: block;
+      margin-bottom: 8px;
+      font-weight: 650;
+    }
+
+    textarea,
+    input,
+    select {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      color: var(--text);
+      font: inherit;
+      outline: none;
+    }
+
+    textarea {
+      min-height: 230px;
+      padding: 14px;
+      resize: vertical;
+      line-height: 1.5;
+    }
+
+    textarea:focus,
+    input:focus,
+    select:focus {
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px rgba(23, 105, 224, 0.14);
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+      margin-top: 16px;
+    }
+
+    .field input,
+    .field select {
+      height: 42px;
+      padding: 0 12px;
+    }
+
+    .toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin: 18px 0;
+      flex-wrap: wrap;
+    }
+
+    .count {
+      color: var(--muted);
+    }
+
+    .actions {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    button,
+    a.button {
+      height: 40px;
+      padding: 0 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      color: var(--text);
+      font: inherit;
+      font-weight: 650;
+      cursor: pointer;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 7px;
+    }
+
+    button.primary {
+      border-color: var(--primary);
+      background: var(--primary);
+      color: #fff;
+    }
+
+    button.primary:hover {
+      background: var(--primary-dark);
+    }
+
+    button:disabled,
+    a.button.disabled {
+      opacity: 0.48;
+      cursor: not-allowed;
+      pointer-events: none;
+    }
+
+    .result {
+      margin-top: 12px;
+    }
+
+    .result textarea {
+      min-height: 104px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 13px;
+      word-break: break-all;
+    }
+
+    .message {
+      min-height: 22px;
+      margin-top: 10px;
+      color: var(--muted);
+    }
+
+    .message.error {
+      color: var(--danger);
+    }
+
+    @media (max-width: 720px) {
+      main {
+        width: min(100vw - 24px, 960px);
+        margin: 18px auto;
+      }
+
+      header {
+        align-items: flex-start;
+        flex-direction: column;
+        gap: 12px;
+      }
+
+      h1 {
+        font-size: 25px;
+      }
+
+      .grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>本地订阅转换</h1>
+      </div>
+      <div id="status" class="status">
+        <span class="dot"></span>
+        <span>检查转换服务中</span>
+      </div>
+    </header>
+
+    <section>
+      <label for="subscriptions">小火箭订阅地址或节点内容</label>
+      <textarea id="subscriptions" spellcheck="false" placeholder="每行一个订阅地址&#10;https://example.com/api/v1/client/subscribe?token=...&#10;https://example.net/sub/...&#10;&#10;也可以直接粘贴 Base64 订阅内容、vless://、vmess://、trojan:// 等节点文本"></textarea>
+
+      <div class="grid">
+        <div class="field">
+          <label for="target">转换目标</label>
+          <select id="target">
+            <option value="mihomo">Mihomo / Clash.Meta（全协议）</option>
+            <option value="clash">Clash</option>
+            <option value="clashr">ClashR</option>
+            <option value="mixed">Mixed</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="config">规则配置</label>
+          <select id="config">
+            <option value="">默认规则</option>
+            <option value="config/ACL4SSR_Online.ini">ACL4SSR Online</option>
+            <option value="config/ACL4SSR_Online_Full.ini">ACL4SSR Full</option>
+            <option value="config/ACL4SSR_Online_Mini.ini">ACL4SSR Mini</option>
+            <option value="config/ACL4SSR_Online_NoAuto.ini">ACL4SSR NoAuto</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="backend">经典转换服务</label>
+          <input id="backend" value="http://127.0.0.1:25500">
+        </div>
+      </div>
+
+      <div class="toolbar">
+        <div id="count" class="count">已输入 0 个地址</div>
+        <div class="actions">
+          <button id="clear">清空</button>
+          <button id="generate" class="primary">生成转换链接</button>
+        </div>
+      </div>
+
+      <div class="result">
+        <label for="result">Clash 订阅链接</label>
+        <textarea id="result" readonly placeholder="生成后把这里的链接添加到 Clash 订阅"></textarea>
+      </div>
+
+      <div class="toolbar">
+        <div id="message" class="message"></div>
+        <div class="actions">
+          <button id="copy" disabled>复制链接</button>
+          <a id="open" class="button disabled" href="#" target="_blank" rel="noreferrer">打开预览</a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const subscriptions = document.querySelector("#subscriptions");
+    const target = document.querySelector("#target");
+    const config = document.querySelector("#config");
+    const backend = document.querySelector("#backend");
+    const result = document.querySelector("#result");
+    const count = document.querySelector("#count");
+    const message = document.querySelector("#message");
+    const copy = document.querySelector("#copy");
+    const openLink = document.querySelector("#open");
+    const status = document.querySelector("#status");
+
+    function normalizeBackend(value) {
+      return value.trim().replace(/\/+$/, "");
+    }
+
+    function getEntries() {
+      return subscriptions.value
+        .split(/\n+/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+    }
+
+    function getHttpUrls() {
+      return getEntries().filter((line) => /^https?:\/\//i.test(line));
+    }
+
+    function isUrlOnlyInput() {
+      const entries = getEntries();
+      return entries.length > 0 && entries.every((line) => /^https?:\/\//i.test(line));
+    }
+
+    function setMessage(text, isError = false) {
+      message.textContent = text;
+      message.classList.toggle("error", isError);
+    }
+
+    function updateCount() {
+      const entries = getEntries();
+      const urls = getHttpUrls();
+      if (!entries.length) {
+        count.textContent = "已输入 0 个地址";
+      } else if (isUrlOnlyInput()) {
+        count.textContent = `已输入 ${urls.length} 个地址`;
+      } else {
+        count.textContent = "已输入 1 份节点内容";
+      }
+    }
+
+    function setResult(url) {
+      result.value = url;
+      copy.disabled = !url;
+      openLink.href = url || "#";
+      openLink.classList.toggle("disabled", !url);
+    }
+
+    async function saveRawContent() {
+      const response = await fetch("/api/raw", {
+        method: "POST",
+        headers: { "Content-Type": "text/plain; charset=utf-8" },
+        body: subscriptions.value.trim()
+      });
+
+      if (!response.ok) {
+        throw new Error("raw content save failed");
+      }
+
+      return response.text();
+    }
+
+    async function generate() {
+      const entries = getEntries();
+      const base = normalizeBackend(backend.value);
+
+      if (!base) {
+        setMessage("请填写转换服务地址。", true);
+        setResult("");
+        return;
+      }
+
+      if (!entries.length) {
+        setMessage("请至少粘贴一个订阅地址或节点内容。", true);
+        setResult("");
+        return;
+      }
+
+      document.querySelector("#generate").disabled = true;
+      setMessage("正在生成...");
+
+      const params = new URLSearchParams();
+      params.set("target", target.value);
+      params.set("insert", "false");
+
+      if (config.value) {
+        params.set("config", config.value);
+      }
+
+      try {
+        if (target.value === "mihomo") {
+          if (isUrlOnlyInput()) {
+            setMessage("全协议模式请粘贴节点内容或 Base64 订阅内容；订阅网址仍使用 Clash 经典模式。", true);
+            setResult("");
+            return;
+          }
+          await saveRawContent();
+          setResult("http://127.0.0.1:25501/api/mihomo");
+          setMessage("已生成 Mihomo/Clash.Meta 全协议订阅链接。");
+        } else if (isUrlOnlyInput()) {
+          params.set("url", entries.join("|"));
+          setMessage(`已合并 ${entries.length} 个订阅地址。`);
+          const converted = `${base}/sub?${params.toString()}`;
+          setResult(converted);
+        } else {
+          const rawUrl = await saveRawContent();
+          params.set("url", rawUrl.trim());
+          setMessage("已接收节点内容，并生成转换链接。");
+          const converted = `${base}/sub?${params.toString()}`;
+          setResult(converted);
+        }
+      } catch {
+        setMessage("生成失败，请确认本地网页界面仍在运行。", true);
+        setResult("");
+      } finally {
+        document.querySelector("#generate").disabled = false;
+      }
+    }
+
+    async function copyResult() {
+      if (!result.value) return;
+      await navigator.clipboard.writeText(result.value);
+      setMessage("已复制。");
+    }
+
+    async function checkBackend() {
+      const base = normalizeBackend(backend.value || "http://127.0.0.1:25500");
+      try {
+        const response = await fetch(`/api/check?backend=${encodeURIComponent(base)}`, { cache: "no-store" });
+        if (!response.ok) throw new Error("backend unavailable");
+        status.className = "status ok";
+        status.querySelector("span:last-child").textContent = "转换服务正常";
+      } catch {
+        status.className = "status bad";
+        status.querySelector("span:last-child").textContent = "转换服务不可用";
+      }
+    }
+
+    subscriptions.addEventListener("input", updateCount);
+    backend.addEventListener("change", checkBackend);
+    document.querySelector("#generate").addEventListener("click", generate);
+    document.querySelector("#clear").addEventListener("click", () => {
+      subscriptions.value = "";
+      setResult("");
+      setMessage("");
+      updateCount();
+    });
+    copy.addEventListener("click", copyResult);
+
+    updateCount();
+    checkBackend();
+  </script>
+</body>
+</html>
