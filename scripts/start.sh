@@ -3,6 +3,13 @@ set -eu
 
 ROOT="/Users/zhang/Documents/Codex/2026-05-10/clash"
 USER_ID="$(id -u)"
+SUBCONVERTER_URL="https://github.com/tindy2013/subconverter/releases/download/v0.9.0/subconverter_darwinarm.tar.gz"
+
+if [ ! -x "$ROOT/subconverter/subconverter" ]; then
+  mkdir -p "$ROOT"
+  curl -L -o "$ROOT/subconverter_darwinarm.tar.gz" "$SUBCONVERTER_URL"
+  tar -xzf "$ROOT/subconverter_darwinarm.tar.gz" -C "$ROOT"
+fi
 
 rm -rf /tmp/local-subconverter /tmp/subconverter-ui
 mkdir -p /tmp/local-subconverter /tmp/subconverter-ui
