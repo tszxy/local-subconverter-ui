@@ -1,4 +1,4 @@
-from base64 import b64decode, b64encode
+from base64 import b64decode, b64encode, urlsafe_b64decode
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
@@ -106,13 +106,22 @@ def decode_subscription(text):
     if "://" in text:
         return text
 
+    decoded = decode_base64_text(text)
+    return decoded or text
+
+
+def decode_base64_text(text):
     compact = "".join(text.split())
+    if not compact:
+        return ""
     padding = "=" * (-len(compact) % 4)
-    try:
-        decoded = b64decode(compact + padding, validate=False)
-        return decoded.decode("utf-8", errors="ignore")
-    except Exception:
-        return text
+    for decoder in (urlsafe_b64decode, b64decode):
+        try:
+            decoded = decoder(compact + padding)
+            return decoded.decode("utf-8", errors="ignore")
+        except Exception:
+            continue
+    return ""
 
 
 def parse_nodes(text):
@@ -227,19 +236,22 @@ def parse_vmess(line):
 
 def parse_ss(line):
     parsed = urlparse(line)
-    name = parsed.fragment or parsed.hostname or "SS"
-    userinfo = parsed.netloc.rsplit("@", 1)[0] if "@" in parsed.netloc else parsed.username
+    name = parsed.fragment or "SS"
+    payload = line.removeprefix("ss://").split("#", 1)[0].split("?", 1)[0]
+    userinfo = ""
     server = parsed.hostname
     port = parsed.port
 
-    if "@" not in parsed.netloc:
-        decoded = decode_subscription(userinfo or "")
+    if "@" in payload:
+        userinfo, host = payload.rsplit("@", 1)
+        server, port = parse_host_port(host)
+    else:
+        decoded = decode_base64_text(payload)
         if "@" in decoded:
             userinfo, host = decoded.rsplit("@", 1)
-            server, _, port_text = host.rpartition(":")
-            port = int(port_text or 0)
+            server, port = parse_host_port(host)
 
-    decoded_userinfo = decode_subscription(userinfo or "")
+    decoded_userinfo = decode_base64_text(userinfo or "") or unquote(userinfo or "")
     if ":" not in decoded_userinfo:
         decoded_userinfo = unquote(userinfo or "")
     method, _, password = decoded_userinfo.partition(":")
@@ -254,6 +266,19 @@ def parse_ss(line):
         "udp": True,
     }
     return proxy if proxy["server"] and proxy["port"] and method and password else None
+
+
+def parse_host_port(host):
+    host = unquote(host).strip()
+    if host.startswith("[") and "]:" in host:
+        server, _, port_text = host[1:].partition("]:")
+    else:
+        server, _, port_text = host.rpartition(":")
+    try:
+        port = int(port_text or 0)
+    except ValueError:
+        port = 0
+    return server, port
 
 
 def first(query, key):
