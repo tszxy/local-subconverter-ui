@@ -443,6 +443,27 @@ def add_transport_params(params, proxy):
         service = grpc_opts.get("grpc-service-name")
         if service:
             params["serviceName"] = service
+    elif network in ("h2", "http"):
+        h2_opts = proxy.get("h2-opts") or proxy.get("http-opts") or {}
+        # http-opts 的 path / host 可能是列表，取首项
+        path = h2_opts.get("path")
+        if isinstance(path, list):
+            path = path[0] if path else ""
+        if path:
+            params["path"] = path
+        hosts = (h2_opts.get("headers") or {}).get("Host") or h2_opts.get("host")
+        if isinstance(hosts, list):
+            hosts = hosts[0] if hosts else ""
+        if hosts:
+            params["host"] = hosts
+    elif network in ("xhttp", "splithttp"):
+        xhttp_opts = proxy.get("xhttp-opts") or {}
+        if xhttp_opts.get("path"):
+            params["path"] = xhttp_opts["path"]
+        if xhttp_opts.get("host"):
+            params["host"] = xhttp_opts["host"]
+        if xhttp_opts.get("mode"):
+            params["mode"] = xhttp_opts["mode"]
 
 
 def build_share_url(scheme, userinfo, server, port, params, name):
