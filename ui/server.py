@@ -1,6 +1,9 @@
 from base64 import b64decode, b64encode, urlsafe_b64decode
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import json
+import logging
+import os
+import threading
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 from urllib.request import Request, urlopen
@@ -12,14 +15,66 @@ ROOT = Path(__file__).resolve().parent
 RAW_DIR = ROOT / "raw"
 RAW_FILE = RAW_DIR / "subscription.txt"
 
+# 可通过环境变量覆盖监听地址与端口
+HOST = os.environ.get("SUBUI_HOST", "127.0.0.1")
+PORT = int(os.environ.get("SUBUI_PORT", "25501"))
+DEFAULT_BACKEND = os.environ.get("SUBUI_BACKEND", "http://127.0.0.1:25500")
+PUBLIC_BASE = f"http://{HOST}:{PORT}"
+
+# 仅允许这些 Host 头访问，防止本机其它网页 / DNS rebinding 偷读订阅
+ALLOWED_HOSTS = {
+    f"127.0.0.1:{PORT}",
+    f"localhost:{PORT}",
+    f"[::1]:{PORT}",
+}
+
+# raw 订阅文件是全局单文件，写入加锁避免并发覆盖竞态
+RAW_LOCK = threading.Lock()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("subconverter-ui")
+
+
+def safe_int(value, default=0):
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
 
 class Handler(SimpleHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        log.info("%s - %s", self.address_string(), fmt % args)
+
+    def host_allowed(self):
+        host = (self.headers.get("Host") or "").strip().lower()
+        return host in ALLOWED_HOSTS
+
+    def reject_forbidden(self):
+        """非本机 Host 头直接拒绝，挡住跨站 / rebinding 读取。"""
+        if self.host_allowed():
+            return False
+        self.send_response(403)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write("forbidden host".encode("utf-8"))
+        return True
+
     def translate_path(self, path):
         parsed = urlparse(path)
         clean = parsed.path.lstrip("/") or "index.html"
-        return str((ROOT / clean).resolve())
+        target = (ROOT / clean).resolve()
+        # 防止 ../ 逃逸出 ROOT 造成任意文件读取
+        if target != ROOT and ROOT not in target.parents:
+            return str(ROOT / "index.html")
+        return str(target)
 
     def do_GET(self):
+        if self.reject_forbidden():
+            return
         parsed = urlparse(self.path)
         if parsed.path == "/api/check":
             self.check_backend(parsed.query)
@@ -32,7 +87,14 @@ class Handler(SimpleHTTPRequestHandler):
             return
         super().do_GET()
 
+    def do_HEAD(self):
+        if self.reject_forbidden():
+            return
+        super().do_HEAD()
+
     def do_POST(self):
+        if self.reject_forbidden():
+            return
         parsed = urlparse(self.path)
         if parsed.path == "/api/raw":
             self.save_raw_subscription()
@@ -42,7 +104,7 @@ class Handler(SimpleHTTPRequestHandler):
 
     def check_backend(self, query):
         params = parse_qs(query)
-        backend = params.get("backend", ["http://127.0.0.1:25500"])[0].rstrip("/")
+        backend = params.get("backend", [DEFAULT_BACKEND])[0].rstrip("/")
 
         if not backend.startswith(("http://127.0.0.1:", "http://localhost:")):
             self.send_response(400)
@@ -77,13 +139,14 @@ class Handler(SimpleHTTPRequestHandler):
         if "://" in text:
             body = b64encode(body)
 
-        RAW_DIR.mkdir(parents=True, exist_ok=True)
-        RAW_FILE.write_bytes(body + b"\n")
+        with RAW_LOCK:
+            RAW_DIR.mkdir(parents=True, exist_ok=True)
+            RAW_FILE.write_bytes(body + b"\n")
 
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"http://127.0.0.1:25501/raw/subscription.txt")
+        self.wfile.write(f"{PUBLIC_BASE}/raw/subscription.txt".encode("utf-8"))
 
     def render_mihomo(self):
         if not RAW_FILE.exists():
@@ -112,7 +175,15 @@ class Handler(SimpleHTTPRequestHandler):
             return
 
         proxies = parse_clash_proxies(RAW_FILE.read_text(encoding="utf-8", errors="ignore"))
-        links = [link for link in (proxy_to_v2rayn(proxy) for proxy in proxies) if link]
+        links = []
+        for proxy in proxies:
+            try:
+                link = proxy_to_v2rayn(proxy)
+            except Exception:
+                log.warning("跳过无法转换的 Clash 节点: %s", proxy.get("name"))
+                link = None
+            if link:
+                links.append(link)
         if not links:
             self.send_response(422)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -166,14 +237,18 @@ def parse_nodes(text):
             continue
 
         proxy = None
-        if line.startswith("vless://"):
-            proxy = parse_vless(line)
-        elif line.startswith("trojan://"):
-            proxy = parse_trojan(line)
-        elif line.startswith("vmess://"):
-            proxy = parse_vmess(line)
-        elif line.startswith("ss://"):
-            proxy = parse_ss(line)
+        try:
+            if line.startswith("vless://"):
+                proxy = parse_vless(line)
+            elif line.startswith("trojan://"):
+                proxy = parse_trojan(line)
+            elif line.startswith("vmess://"):
+                proxy = parse_vmess(line)
+            elif line.startswith("ss://"):
+                proxy = parse_ss(line)
+        except Exception:
+            log.warning("跳过无法解析的节点: %.40s", line)
+            proxy = None
 
         if proxy:
             proxy["name"] = unique_name(proxy.get("name") or proxy["server"], used_names)
@@ -214,24 +289,43 @@ def clash_vmess_to_link(proxy):
     if not server or not uuid:
         return None
 
-    network = proxy.get("network") or "tcp"
-    ws_opts = proxy.get("ws-opts") or {}
-    ws_headers = ws_opts.get("headers") or {}
-    grpc_opts = proxy.get("grpc-opts") or {}
+    network = str(proxy.get("network") or "tcp")
+    host = ""
+    path = ""
+    if network == "ws":
+        ws_opts = proxy.get("ws-opts") or {}
+        ws_headers = ws_opts.get("headers") or {}
+        host = ws_headers.get("Host") or ws_headers.get("host") or ""
+        path = ws_opts.get("path") or ""
+    elif network == "grpc":
+        grpc_opts = proxy.get("grpc-opts") or {}
+        path = grpc_opts.get("grpc-service-name") or ""
+    elif network in ("h2", "http"):
+        h2_opts = proxy.get("h2-opts") or proxy.get("http-opts") or {}
+        hosts = h2_opts.get("host") or []
+        host = (hosts[0] if hosts else "") if isinstance(hosts, list) else str(hosts)
+        h2_path = h2_opts.get("path") or ""
+        path = (h2_path[0] if h2_path else "") if isinstance(h2_path, list) else str(h2_path)
+
+    sni = proxy.get("servername") or proxy.get("sni") or ""
+    # 仅传输层需要伪装域名时，host 缺省回退到 sni；tcp 不写 host
+    if not host and network in ("ws", "h2", "http"):
+        host = sni
+
     data = {
         "v": "2",
         "ps": str(proxy.get("name") or server),
         "add": str(server),
-        "port": str(proxy.get("port") or 443),
+        "port": str(safe_int(proxy.get("port"), 443)),
         "id": str(uuid),
         "aid": str(proxy.get("alterId") or proxy.get("alterid") or 0),
         "scy": str(proxy.get("cipher") or "auto"),
-        "net": str(network),
+        "net": network,
         "type": "none",
-        "host": str(ws_headers.get("Host") or ws_headers.get("host") or proxy.get("servername") or proxy.get("sni") or ""),
-        "path": str(ws_opts.get("path") or grpc_opts.get("grpc-service-name") or ""),
+        "host": str(host),
+        "path": str(path),
         "tls": "tls" if proxy.get("tls") else "",
-        "sni": str(proxy.get("servername") or proxy.get("sni") or ""),
+        "sni": str(sni),
         "fp": str(proxy.get("client-fingerprint") or ""),
     }
     return "vmess://" + encode_base64_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")))
@@ -273,9 +367,43 @@ def clash_ss_to_link(proxy):
     if not server or not cipher or not password:
         return None
 
-    port = proxy.get("port") or 443
-    payload = encode_base64_text(f"{cipher}:{password}@{server}:{port}")
-    return f"ss://{payload}#{quote(str(proxy.get('name') or server), safe='')}"
+    port = safe_int(proxy.get("port"), 443)
+    # SIP002: 仅对 method:password 做 base64，host/port 明文，更稳且能携带插件
+    userinfo = encode_base64_text(f"{cipher}:{password}")
+    plugin = build_ss_plugin(proxy)
+    query = f"?plugin={quote(plugin, safe='')}" if plugin else ""
+    name = quote(str(proxy.get("name") or server), safe="")
+    return f"ss://{userinfo}@{server}:{port}{query}#{name}"
+
+
+def build_ss_plugin(proxy):
+    plugin = str(proxy.get("plugin") or "").strip()
+    if not plugin:
+        return ""
+    opts = proxy.get("plugin-opts") or {}
+
+    if plugin in ("obfs", "simple-obfs"):
+        parts = ["obfs-local"]
+        if opts.get("mode"):
+            parts.append(f"obfs={opts['mode']}")
+        if opts.get("host"):
+            parts.append(f"obfs-host={opts['host']}")
+        return ";".join(parts)
+
+    if plugin == "v2ray-plugin":
+        parts = ["v2ray-plugin"]
+        if opts.get("mode"):
+            parts.append(f"mode={opts['mode']}")
+        if opts.get("tls"):
+            parts.append("tls")
+        if opts.get("host"):
+            parts.append(f"host={opts['host']}")
+        if opts.get("path"):
+            parts.append(f"path={opts['path']}")
+        return ";".join(parts)
+
+    # 未知插件不臆造参数，避免生成错误链接
+    return ""
 
 
 def add_tls_params(params, proxy, default_tls=False):
@@ -320,11 +448,11 @@ def add_transport_params(params, proxy):
 def build_share_url(scheme, userinfo, server, port, params, name):
     query = urlencode({key: value for key, value in params.items() if value})
     fragment = quote(str(name), safe="")
-    return f"{scheme}://{quote(str(userinfo), safe='')}@{server}:{int(port)}?{query}#{fragment}"
+    return f"{scheme}://{quote(str(userinfo), safe='')}@{server}:{safe_int(port, 443)}?{query}#{fragment}"
 
 
 def unique_name(name, used):
-    base = yaml_scalar(unquote(name).strip() or "节点", quote=False)
+    base = unquote(name).strip() or "节点"
     name = base
     index = 2
     while name in used:
@@ -344,7 +472,7 @@ def parse_vless(line):
         "type": "vless",
         "server": parsed.hostname,
         "port": parsed.port or 443,
-        "uuid": parsed.username,
+        "uuid": unquote(parsed.username) if parsed.username else None,
         "udp": True,
         "tls": security in ("tls", "reality"),
     }
@@ -366,7 +494,7 @@ def parse_trojan(line):
         "type": "trojan",
         "server": parsed.hostname,
         "port": parsed.port or 443,
-        "password": parsed.username,
+        "password": unquote(parsed.username) if parsed.username else None,
         "udp": True,
         "tls": security in ("tls", "reality"),
     }
@@ -387,9 +515,9 @@ def parse_vmess(line):
         "name": data.get("ps") or data.get("add") or "VMess",
         "type": "vmess",
         "server": data.get("add"),
-        "port": int(data.get("port") or 443),
+        "port": safe_int(data.get("port"), 443),
         "uuid": data.get("id"),
-        "alterId": int(data.get("aid") or 0),
+        "alterId": safe_int(data.get("aid"), 0),
         "cipher": data.get("scy") or "auto",
         "udp": True,
         "tls": str(data.get("tls", "")).lower() == "tls",
@@ -437,7 +565,62 @@ def parse_ss(line):
         "password": password,
         "udp": True,
     }
+
+    # 还原 SIP002 插件参数，避免导入带 obfs / v2ray-plugin 的 SS 链接后丢失插件
+    plugin_name, plugin_opts = parse_ss_plugin(extract_query_value(parsed.query, "plugin"))
+    if plugin_name:
+        proxy["plugin"] = plugin_name
+        if plugin_opts:
+            proxy["plugin-opts"] = plugin_opts
+
     return proxy if proxy["server"] and proxy["port"] and method and password else None
+
+
+def extract_query_value(raw_query, key):
+    # 手动按 & 切分, 不依赖 parse_qs 对 ; 的版本相关处理
+    prefix = key + "="
+    for part in (raw_query or "").split("&"):
+        if part.startswith(prefix):
+            return unquote(part[len(prefix):])
+    return ""
+
+
+def parse_ss_plugin(plugin_str):
+    plugin_str = (plugin_str or "").strip()
+    if not plugin_str:
+        return None, None
+
+    segments = [seg for seg in plugin_str.split(";") if seg]
+    if not segments:
+        return None, None
+
+    plugin = segments[0]
+    opts = {}
+    for seg in segments[1:]:
+        key, sep, value = seg.partition("=")
+        opts[key] = value if sep else True  # 无值项视为开关, 如 tls
+
+    if plugin in ("obfs-local", "simple-obfs", "obfs"):
+        clash_opts = {}
+        if opts.get("obfs"):
+            clash_opts["mode"] = opts["obfs"]
+        if opts.get("obfs-host"):
+            clash_opts["host"] = opts["obfs-host"]
+        return "obfs", clash_opts
+
+    if plugin == "v2ray-plugin":
+        clash_opts = {}
+        if opts.get("mode"):
+            clash_opts["mode"] = opts["mode"]
+        if "tls" in opts:
+            clash_opts["tls"] = True
+        if opts.get("host"):
+            clash_opts["host"] = opts["host"]
+        if opts.get("path"):
+            clash_opts["path"] = opts["path"]
+        return "v2ray-plugin", clash_opts
+
+    return None, None
 
 
 def parse_host_port(host):
@@ -490,76 +673,41 @@ def add_network(proxy, query, network):
 
 def build_mihomo_config(proxies):
     names = [proxy["name"] for proxy in proxies]
-    lines = [
-        "mixed-port: 7890",
-        "allow-lan: true",
-        "mode: rule",
-        "log-level: info",
-        "external-controller: 127.0.0.1:9090",
-        "proxies:",
-    ]
-
-    for proxy in proxies:
-        lines.extend(render_proxy(proxy))
-
-    lines.extend([
-        "proxy-groups:",
-        "  - name: 节点选择",
-        "    type: select",
-        "    proxies:",
-        "      - 自动选择",
-        "      - DIRECT",
-    ])
-    lines.extend([f"      - {yaml_scalar(name)}" for name in names])
-    lines.extend([
-        "  - name: 自动选择",
-        "    type: url-test",
-        "    url: http://www.gstatic.com/generate_204",
-        "    interval: 300",
-        "    proxies:",
-    ])
-    lines.extend([f"      - {yaml_scalar(name)}" for name in names])
-    lines.extend([
-        "rules:",
-        "  - GEOIP,CN,DIRECT",
-        "  - MATCH,节点选择",
-        "",
-    ])
-    return "\n".join(lines)
-
-
-def render_proxy(proxy):
-    lines = ["  - " + render_kv("name", proxy["name"])]
-    for key, value in proxy.items():
-        if key == "name":
-            continue
-        lines.append(f"    {key}: {render_value(value)}")
-    return lines
-
-
-def render_kv(key, value):
-    return f"{key}: {render_value(value)}"
-
-
-def render_value(value):
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, int):
-        return str(value)
-    if isinstance(value, dict):
-        inner = ", ".join(f"{k}: {render_value(v)}" for k, v in value.items() if v)
-        return "{" + inner + "}"
-    return yaml_scalar(str(value))
-
-
-def yaml_scalar(value, quote=True):
-    value = value.strip()
-    if not quote and value:
-        return value
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-    return f'"{escaped}"'
+    config = {
+        "mixed-port": 7890,
+        "allow-lan": True,
+        "mode": "rule",
+        "log-level": "info",
+        "external-controller": "127.0.0.1:9090",
+        "proxies": proxies,
+        "proxy-groups": [
+            {
+                "name": "节点选择",
+                "type": "select",
+                "proxies": ["自动选择", "DIRECT", *names],
+            },
+            {
+                "name": "自动选择",
+                "type": "url-test",
+                "url": "http://www.gstatic.com/generate_204",
+                "interval": 300,
+                "proxies": names,
+            },
+        ],
+        "rules": [
+            "GEOIP,CN,DIRECT",
+            "MATCH,节点选择",
+        ],
+    }
+    # allow_unicode 保留中文节点名；sort_keys=False 保持字段顺序可读
+    return yaml.safe_dump(config, allow_unicode=True, sort_keys=False, default_flow_style=False)
 
 
 if __name__ == "__main__":
-    server = ThreadingHTTPServer(("127.0.0.1", 25501), Handler)
-    server.serve_forever()
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    log.info("本地订阅转换网页界面已启动: %s/", PUBLIC_BASE)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        log.info("正在关闭...")
+        server.shutdown()

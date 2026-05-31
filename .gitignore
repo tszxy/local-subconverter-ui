@@ -4,5 +4,6 @@
 *.tar.gz
 ui/raw/
 subconverter/
-subconverter/subconverter.log
-subconverter/subconverter.pid
+.venv/
+venv/
+.backup/
