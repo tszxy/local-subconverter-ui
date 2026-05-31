@@ -2,8 +2,10 @@ from base64 import b64decode, b64encode, urlsafe_b64decode
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 from urllib.request import Request, urlopen
+
+import yaml
 
 
 ROOT = Path(__file__).resolve().parent
@@ -24,6 +26,9 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if parsed.path == "/api/mihomo":
             self.render_mihomo()
+            return
+        if parsed.path == "/api/v2rayn":
+            self.render_v2rayn()
             return
         super().do_GET()
 
@@ -100,14 +105,36 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(config.encode("utf-8"))
 
+    def render_v2rayn(self):
+        if not RAW_FILE.exists():
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        proxies = parse_clash_proxies(RAW_FILE.read_text(encoding="utf-8", errors="ignore"))
+        links = [link for link in (proxy_to_v2rayn(proxy) for proxy in proxies) if link]
+        if not links:
+            self.send_response(422)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write("没有识别到可转换的 Clash 节点。".encode("utf-8"))
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(("\n".join(links) + "\n").encode("utf-8"))
+
 
 def decode_subscription(text):
     text = text.strip()
-    if "://" in text:
+    if "://" in text or "proxies:" in text:
         return text
 
     decoded = decode_base64_text(text)
-    return decoded or text
+    if "://" in decoded or "proxies:" in decoded:
+        return decoded
+    return text
 
 
 def decode_base64_text(text):
@@ -122,6 +149,10 @@ def decode_base64_text(text):
         except Exception:
             continue
     return ""
+
+
+def encode_base64_text(text):
+    return b64encode(text.encode("utf-8")).decode("ascii").rstrip("=")
 
 
 def parse_nodes(text):
@@ -149,6 +180,147 @@ def parse_nodes(text):
             proxies.append(proxy)
 
     return proxies
+
+
+def parse_clash_proxies(text):
+    decoded = decode_subscription(text)
+    try:
+        data = yaml.safe_load(decoded) or {}
+    except Exception:
+        return []
+
+    proxies = data.get("proxies", []) if isinstance(data, dict) else []
+    if not isinstance(proxies, list):
+        return []
+    return [proxy for proxy in proxies if isinstance(proxy, dict)]
+
+
+def proxy_to_v2rayn(proxy):
+    proxy_type = str(proxy.get("type", "")).lower()
+    if proxy_type == "vmess":
+        return clash_vmess_to_link(proxy)
+    if proxy_type == "vless":
+        return clash_vless_to_link(proxy)
+    if proxy_type == "trojan":
+        return clash_trojan_to_link(proxy)
+    if proxy_type == "ss":
+        return clash_ss_to_link(proxy)
+    return None
+
+
+def clash_vmess_to_link(proxy):
+    server = proxy.get("server")
+    uuid = proxy.get("uuid")
+    if not server or not uuid:
+        return None
+
+    network = proxy.get("network") or "tcp"
+    ws_opts = proxy.get("ws-opts") or {}
+    ws_headers = ws_opts.get("headers") or {}
+    grpc_opts = proxy.get("grpc-opts") or {}
+    data = {
+        "v": "2",
+        "ps": str(proxy.get("name") or server),
+        "add": str(server),
+        "port": str(proxy.get("port") or 443),
+        "id": str(uuid),
+        "aid": str(proxy.get("alterId") or proxy.get("alterid") or 0),
+        "scy": str(proxy.get("cipher") or "auto"),
+        "net": str(network),
+        "type": "none",
+        "host": str(ws_headers.get("Host") or ws_headers.get("host") or proxy.get("servername") or proxy.get("sni") or ""),
+        "path": str(ws_opts.get("path") or grpc_opts.get("grpc-service-name") or ""),
+        "tls": "tls" if proxy.get("tls") else "",
+        "sni": str(proxy.get("servername") or proxy.get("sni") or ""),
+        "fp": str(proxy.get("client-fingerprint") or ""),
+    }
+    return "vmess://" + encode_base64_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")))
+
+
+def clash_vless_to_link(proxy):
+    server = proxy.get("server")
+    uuid = proxy.get("uuid")
+    if not server or not uuid:
+        return None
+
+    params = {
+        "encryption": "none",
+        "type": proxy.get("network") or "tcp",
+    }
+    add_tls_params(params, proxy)
+    add_transport_params(params, proxy)
+    if proxy.get("flow"):
+        params["flow"] = proxy["flow"]
+    return build_share_url("vless", uuid, server, proxy.get("port") or 443, params, proxy.get("name") or server)
+
+
+def clash_trojan_to_link(proxy):
+    server = proxy.get("server")
+    password = proxy.get("password")
+    if not server or not password:
+        return None
+
+    params = {"type": proxy.get("network") or "tcp"}
+    add_tls_params(params, proxy, default_tls=True)
+    add_transport_params(params, proxy)
+    return build_share_url("trojan", password, server, proxy.get("port") or 443, params, proxy.get("name") or server)
+
+
+def clash_ss_to_link(proxy):
+    server = proxy.get("server")
+    cipher = proxy.get("cipher")
+    password = proxy.get("password")
+    if not server or not cipher or not password:
+        return None
+
+    port = proxy.get("port") or 443
+    payload = encode_base64_text(f"{cipher}:{password}@{server}:{port}")
+    return f"ss://{payload}#{quote(str(proxy.get('name') or server), safe='')}"
+
+
+def add_tls_params(params, proxy, default_tls=False):
+    if proxy.get("reality-opts"):
+        params["security"] = "reality"
+        reality = proxy.get("reality-opts") or {}
+        if reality.get("public-key"):
+            params["pbk"] = reality["public-key"]
+        if reality.get("short-id"):
+            params["sid"] = reality["short-id"]
+    elif proxy.get("tls") or default_tls:
+        params["security"] = "tls"
+    else:
+        params["security"] = "none"
+
+    servername = proxy.get("servername") or proxy.get("sni")
+    if servername:
+        params["sni"] = servername
+    if proxy.get("client-fingerprint"):
+        params["fp"] = proxy["client-fingerprint"]
+    if proxy.get("skip-cert-verify"):
+        params["allowInsecure"] = "1"
+
+
+def add_transport_params(params, proxy):
+    network = str(proxy.get("network") or "tcp")
+    if network == "ws":
+        ws_opts = proxy.get("ws-opts") or {}
+        headers = ws_opts.get("headers") or {}
+        if ws_opts.get("path"):
+            params["path"] = ws_opts["path"]
+        host = headers.get("Host") or headers.get("host")
+        if host:
+            params["host"] = host
+    elif network == "grpc":
+        grpc_opts = proxy.get("grpc-opts") or {}
+        service = grpc_opts.get("grpc-service-name")
+        if service:
+            params["serviceName"] = service
+
+
+def build_share_url(scheme, userinfo, server, port, params, name):
+    query = urlencode({key: value for key, value in params.items() if value})
+    fragment = quote(str(name), safe="")
+    return f"{scheme}://{quote(str(userinfo), safe='')}@{server}:{int(port)}?{query}#{fragment}"
 
 
 def unique_name(name, used):

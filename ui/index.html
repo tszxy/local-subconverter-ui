@@ -243,14 +243,15 @@
     </header>
 
     <section>
-      <label for="subscriptions">小火箭订阅地址或节点内容</label>
-      <textarea id="subscriptions" spellcheck="false" placeholder="每行一个订阅地址&#10;https://example.com/api/v1/client/subscribe?token=...&#10;https://example.net/sub/...&#10;&#10;也可以直接粘贴 Base64 订阅内容、vless://、vmess://、trojan:// 等节点文本"></textarea>
+      <label for="subscriptions">订阅地址、节点内容或 Clash 配置</label>
+      <textarea id="subscriptions" spellcheck="false" placeholder="每行一个订阅地址&#10;https://example.com/api/v1/client/subscribe?token=...&#10;https://example.net/sub/...&#10;&#10;也可以直接粘贴 Base64 订阅内容、vless://、vmess://、trojan:// 等节点文本&#10;&#10;选择 v2rayN 时，请粘贴 Clash/Mihomo YAML 配置"></textarea>
 
       <div class="grid">
         <div class="field">
           <label for="target">转换目标</label>
           <select id="target">
             <option value="mihomo">Mihomo / Clash.Meta（全协议）</option>
+            <option value="v2rayn">v2rayN（从 Clash 配置转换）</option>
             <option value="clash">Clash</option>
             <option value="clashr">ClashR</option>
             <option value="mixed">Mixed</option>
@@ -281,7 +282,7 @@
       </div>
 
       <div class="result">
-        <label for="result">Clash 订阅链接</label>
+        <label id="resultLabel" for="result">Clash 订阅链接</label>
         <textarea id="result" readonly placeholder="生成后把这里的链接添加到 Clash 订阅"></textarea>
       </div>
 
@@ -301,6 +302,7 @@
     const config = document.querySelector("#config");
     const backend = document.querySelector("#backend");
     const result = document.querySelector("#result");
+    const resultLabel = document.querySelector("#resultLabel");
     const count = document.querySelector("#count");
     const message = document.querySelector("#message");
     const copy = document.querySelector("#copy");
@@ -351,6 +353,16 @@
       openLink.classList.toggle("disabled", !url);
     }
 
+    function updateResultText() {
+      if (target.value === "v2rayn") {
+        resultLabel.textContent = "v2rayN 订阅链接";
+        result.placeholder = "生成后把这里的链接添加到 v2rayN 订阅，或打开预览复制节点链接";
+      } else {
+        resultLabel.textContent = "Clash 订阅链接";
+        result.placeholder = "生成后把这里的链接添加到 Clash 订阅";
+      }
+    }
+
     async function saveRawContent() {
       const response = await fetch("/api/raw", {
         method: "POST",
@@ -369,7 +381,7 @@
       const entries = getEntries();
       const base = normalizeBackend(backend.value);
 
-      if (!base) {
+      if (!base && !["mihomo", "v2rayn"].includes(target.value)) {
         setMessage("请填写转换服务地址。", true);
         setResult("");
         return;
@@ -402,6 +414,15 @@
           await saveRawContent();
           setResult("http://127.0.0.1:25501/api/mihomo");
           setMessage("已生成 Mihomo/Clash.Meta 全协议订阅链接。");
+        } else if (target.value === "v2rayn") {
+          if (isUrlOnlyInput()) {
+            setMessage("v2rayN 转换请粘贴 Clash/Mihomo YAML 配置内容。", true);
+            setResult("");
+            return;
+          }
+          await saveRawContent();
+          setResult("http://127.0.0.1:25501/api/v2rayn");
+          setMessage("已生成 v2rayN 订阅链接。");
         } else if (isUrlOnlyInput()) {
           params.set("url", entries.join("|"));
           setMessage(`已合并 ${entries.length} 个订阅地址。`);
@@ -443,6 +464,7 @@
 
     subscriptions.addEventListener("input", updateCount);
     backend.addEventListener("change", checkBackend);
+    target.addEventListener("change", updateResultText);
     document.querySelector("#generate").addEventListener("click", generate);
     document.querySelector("#clear").addEventListener("click", () => {
       subscriptions.value = "";
@@ -453,6 +475,7 @@
     copy.addEventListener("click", copyResult);
 
     updateCount();
+    updateResultText();
     checkBackend();
   </script>
 </body>
